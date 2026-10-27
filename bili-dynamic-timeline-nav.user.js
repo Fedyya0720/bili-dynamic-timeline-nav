@@ -5,7 +5,7 @@
 // @supportURL   https://github.com/Fedyya0720/bili-dynamic-timeline-nav/issues
 // @downloadURL  https://raw.githubusercontent.com/Fedyya0720/bili-dynamic-timeline-nav/main/bili-dynamic-timeline-nav.user.js
 // @updateURL    https://raw.githubusercontent.com/Fedyya0720/bili-dynamic-timeline-nav/main/bili-dynamic-timeline-nav.user.js
-// @version      1.0
+// @version      1.1
 // @description  通过B站API全量/增量抓取UP主动态，IndexedDB本地缓存，支持详情页连续翻阅、点击跳转、停止与自动重试
 // @author       https://github.com/Fedyya0720
 // @match        https://space.bilibili.com/*
@@ -17,7 +17,6 @@
 (function () {
     'use strict';
 
-    // ---------- 0. 环境与UID识别 ----------
     const isSpace = window.location.hostname === 'space.bilibili.com';
     const spaceMatch = window.location.pathname.match(/^\/(\d+)/);
     const detailMatch = window.location.pathname.match(/^\/(\d+)/);
@@ -33,53 +32,28 @@
         hostMid = GM_getValue('last_bili_host_mid', null);
     }
 
-    if (!hostMid) {
-        console.warn('[B站导航] 未找到UID，请先在空间页运行。');
-        return;
-    }
+    if (!hostMid) return;
 
-    // ---------- 1. 文本提取核心逻辑 ----------
+    // ---------- 1. 文本提取 ----------
     function extractDynamicText(item) {
         const dynamic = item.modules?.module_dynamic;
         if (!dynamic) return '（无内容）';
 
-        // 1. 优先取纯文字
         if (dynamic.desc?.text && dynamic.desc.text.trim()) {
             return dynamic.desc.text.replace(/\n/g, ' ').slice(0, 80);
         }
 
-        // 2. 解析附加内容 (major)
         const major = dynamic.major;
         if (major) {
-            if (major.type === 'MAJOR_TYPE_ARCHIVE' && major.archive?.title) {
-                return `【视频】${major.archive.title}`;
-            }
-            if (major.type === 'MAJOR_TYPE_ARTICLE' && major.article?.title) {
-                return `【专栏】${major.article.title}`;
-            }
-            if (major.type === 'MAJOR_TYPE_DRAW' && major.draw?.items?.length) {
-                return `【图文】${major.draw.items.length}张图片`;
-            }
-            if (major.type === 'MAJOR_TYPE_LIVE_RCMD' && major.live_rcmd?.content) {
-                return '【直播推荐】';
-            }
-            if (major.type === 'MAJOR_TYPE_PGC' && major.pgc?.title) {
-                return `【番剧】${major.pgc.title}`;
-            }
-            // 新版图文 Opus
+            if (major.type === 'MAJOR_TYPE_ARCHIVE' && major.archive?.title) return `【视频】${major.archive.title}`;
+            if (major.type === 'MAJOR_TYPE_ARTICLE' && major.article?.title) return `【专栏】${major.article.title}`;
+            if (major.type === 'MAJOR_TYPE_DRAW' && major.draw?.items?.length) return `【图文】${major.draw.items.length}张图片`;
             if (major.opus) {
                 if (major.opus.title) return `【图文】${major.opus.title}`;
-                if (major.opus.summary?.text) {
-                    return major.opus.summary.text.replace(/\n/g, ' ').slice(0, 80);
-                }
+                if (major.opus.summary?.text) return major.opus.summary.text.replace(/\n/g, ' ').slice(0, 80);
             }
         }
-
-        // 3. 转发动态兜底
-        if (item.type === 'DYNAMIC_TYPE_FORWARD') {
-            return '【转发动态】';
-        }
-
+        if (item.type === 'DYNAMIC_TYPE_FORWARD') return '【转发动态】';
         return '（无文字内容）';
     }
 
@@ -125,7 +99,7 @@
                     dynamic_id: item.id_str,
                     host_mid: host_mid,
                     timestamp: ts,
-                    text: extractDynamicText(item), // 使用新的提取逻辑
+                    text: extractDynamicText(item),
                     created_at: new Date(ts * 1000).toISOString().slice(0, 10)
                 });
             });
@@ -143,7 +117,6 @@
         });
     }
 
-    // 清空当前 UP 主的缓存
     function clearCache(host_mid) {
         return new Promise((resolve, reject) => {
             const tx = db.transaction('dynamics', 'readwrite');
@@ -152,22 +125,37 @@
             const req = index.openCursor(IDBKeyRange.only(host_mid));
             req.onsuccess = (e) => {
                 const cursor = e.target.result;
-                if (cursor) {
-                    cursor.delete();
-                    cursor.continue();
-                }
+                if (cursor) { cursor.delete(); cursor.continue(); }
             };
             tx.oncomplete = () => resolve();
             tx.onerror = () => reject(tx.error);
         });
     }
 
-    // ---------- 3. API 请求与抓取 ----------
+    // ---------- 3. 状态记录与API ----------
+    // 使用 GM_setValue 记录每个 UP 主的抓取进度（因为 IndexedDB 跨域不方便，且这是简单的键值对）
+    function getProgress(host_mid) {
+        return GM_getValue(`bili_progress_${host_mid}`, { offset: '', is_completed: false, count: 0 });
+    }
+    
+    function saveProgress(host_mid, progress) {
+        GM_setValue(`bili_progress_${host_mid}`, progress);
+    }
+
     async function fetchDynamicPage(host_mid, offset) {
-        const params = new URLSearchParams({ host_mid: host_mid, timezone_offset: '-480' });
+        const params = new URLSearchParams({ 
+            host_mid: host_mid, 
+            timezone_offset: '-480',
+            platform: 'web',
+            features: 'itemOpusStyle'
+        });
         if (offset) params.set('offset', offset);
+        
         const url = `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?${params.toString()}`;
         const res = await fetch(url, { credentials: 'include' });
+        
+        if (res.status === 412) throw new Error('触发了 HTTP 412 风控');
+        
         const json = await res.json();
         if (json.code !== 0) throw new Error(`API ${json.code}: ${json.message || '未知错误'}`);
         return json.data;
@@ -176,34 +164,80 @@
     let crawlAbort = false;
     let isCrawling = false;
 
-    async function crawlAll(host_mid, incremental, onProgress) {
+    // 核心抓取：分为 'history' (历史全量) 和 'update' (抓取最新)
+    async function crawlAll(host_mid, mode, onProgress) {
+        let progress = getProgress(host_mid);
         let offset = '';
-        let totalFetched = 0;
-        let stop = false;
+        
+        if (mode === 'history') {
+            if (progress.is_completed) {
+                // 如果已经抓完了，说明用户想重新抓
+                offset = '';
+                progress = { offset: '', is_completed: false, count: 0 };
+                saveProgress(host_mid, progress);
+            } else {
+                offset = progress.offset;
+                if (offset) onProgress(0, true, `从断点处继续抓取...`);
+            }
+        }
+
+        let totalFetchedThisRun = 0;
         let retryCount = 0;
+        let emptyPageCount = 0;
         const MAX_RETRIES = 3;
 
-        while (!stop && !crawlAbort) {
+        while (!crawlAbort) {
             let data = null;
             try {
                 data = await fetchDynamicPage(host_mid, offset);
-                retryCount = 0;
+                retryCount = 0; 
             } catch (err) {
                 if (retryCount < MAX_RETRIES) {
                     retryCount++;
-                    onProgress(totalFetched, true, `网络波动，${retryCount}秒后重试...`);
-                    await new Promise(r => setTimeout(r, retryCount * 1000));
+                    onProgress(totalFetchedThisRun, true, `网络波动/风控，${retryCount}秒后重试...`);
+                    await new Promise(r => setTimeout(r, retryCount * 2000));
                     continue;
                 } else {
-                    throw new Error(`重试失败，可能被B站临时风控限制。`);
+                    throw new Error(`重试失败: ${err.message}`);
                 }
             }
 
             const items = data.items || [];
-            if (items.length === 0) break;
+            const hasMore = data.has_more;
+            const nextOffset = data.offset;
 
-            if (incremental) {
-                const newItems = [];
+            if (items.length === 0) {
+                emptyPageCount++;
+                if (hasMore && nextOffset && emptyPageCount < 5) {
+                    offset = nextOffset;
+                    await new Promise(r => setTimeout(r, 3000));
+                    continue;
+                } else {
+                    if (mode === 'history') {
+                        progress.is_completed = true;
+                        saveProgress(host_mid, progress);
+                    }
+                    break;
+                }
+            } else {
+                emptyPageCount = 0;
+            }
+
+            if (mode === 'history') {
+                // 【全量/续传】：不管存没存过，直接覆盖存
+                await putDynamics(host_mid, items);
+                totalFetchedThisRun += items.length;
+                
+                // 更新进度
+                progress.offset = nextOffset;
+                progress.count = (progress.count || 0) + items.length;
+                if (!hasMore) progress.is_completed = true;
+                saveProgress(host_mid, progress);
+                
+            } else {
+                // 【抓取最新】：遇到缓存存在就停
+                let newItems = [];
+                let stop = false;
                 for (const item of items) {
                     if (await hasDynamic(item.id_str)) {
                         stop = true;
@@ -213,22 +247,38 @@
                 }
                 if (newItems.length > 0) {
                     await putDynamics(host_mid, newItems);
-                    totalFetched += newItems.length;
+                    totalFetchedThisRun += newItems.length;
                 }
-            } else {
-                await putDynamics(host_mid, items);
-                totalFetched += items.length;
+                if (stop) break; // 接轨了，停止
             }
 
-            onProgress(totalFetched, data.has_more);
-            offset = data.offset;
-            if (!data.has_more || !offset) break;
-            await new Promise(r => setTimeout(r, 1200 + Math.random() * 500));
+            const lastItem = items[items.length - 1];
+            const lastYear = lastItem.modules?.module_author?.pub_ts 
+                ? new Date(lastItem.modules.module_author.pub_ts * 1000).getFullYear() 
+                : '未知';
+
+            onProgress(totalFetchedThisRun, hasMore, mode === 'history' 
+                ? `已抓 ${totalFetchedThisRun} 条 (翻至 ${lastYear} 年)` 
+                : `更新了 ${totalFetchedThisRun} 条`);
+
+            if (!hasMore || !nextOffset) {
+                if (mode === 'history') {
+                    progress.is_completed = true;
+                    saveProgress(host_mid, progress);
+                }
+                break;
+            }
+
+            offset = nextOffset;
+
+            // 动态调整请求间隔
+            const delay = totalFetchedThisRun > 500 ? 2500 + Math.random() * 1000 : 1500 + Math.random() * 500;
+            await new Promise(r => setTimeout(r, delay));
         }
-        return totalFetched;
+        return totalFetchedThisRun;
     }
 
-    // ---------- 4. 样式 ----------
+    // ---------- 4. 样式与 UI ----------
     const style = document.createElement('style');
     style.textContent = `
     #bili-dyn-ball { position: fixed; right: 18px; bottom: 18px; width: 44px; height: 44px; border-radius: 50%; background: linear-gradient(140deg, #00a1d6, #0084b4); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 18px; cursor: pointer; z-index: 999999; box-shadow: 0 3px 12px rgba(0,161,214,.45); transition: transform .2s; font-family: sans-serif; }
@@ -245,12 +295,9 @@
     #bili-dyn-panel button:disabled { opacity: .4; cursor: not-allowed; }
     #bili-dyn-panel .primary { background: #00a1d6; border-color: #00a1d6; color: #fff; font-weight: 600; }
     #bili-dyn-panel .primary:hover:not(:disabled) { background: #00b5e5; }
-    
-    /* 清空和停止按钮的特定样式 */
     #bili-dyn-panel .danger { color: #ff8a8a; border-color: #5a2b2b; background: #2a1c1c; }
     #bili-dyn-panel .danger:hover:not(:disabled) { background: #3f2222; color: #ffa8a8; }
     #bili-dyn-panel .warn { color: #ffb055; background: #38291a; border-color: #7a5322; }
-
     #bili-dyn-list-wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; }
     #bili-dyn-list { flex: 1; overflow-y: auto; background: #202024; border-radius: 8px; font-size: 11px; line-height: 1.45; }
     #bili-dyn-list::-webkit-scrollbar { width: 6px; }
@@ -265,11 +312,9 @@
     `;
     document.head.appendChild(style);
 
-    // ---------- 5. UI ----------
     const ball = document.createElement('div');
     ball.id = 'bili-dyn-ball';
     ball.textContent = '📅';
-    ball.title = 'B站动态时间线导航';
 
     const panel = document.createElement('div');
     panel.id = 'bili-dyn-panel';
@@ -277,15 +322,12 @@
     panel.innerHTML = `
         <div class="header"><span>📅 动态时间线导航</span><span class="close" id="bili-dyn-close">✕</span></div>
         <div class="status" id="bili-dyn-status">正在检查数据…</div>
-        
-        <!-- 抓取按钮组 -->
         <div class="btn-row" id="bili-dyn-crawl-btns">
-            <button id="bili-dyn-full" class="primary">全量抓取</button>
-            <button id="bili-dyn-incr">增量更新</button>
-            <button id="bili-dyn-clear" class="danger" title="清空当前UP主的缓存数据">清空缓存</button>
+            <button id="bili-dyn-full" class="primary">继续全量</button>
+            <button id="bili-dyn-incr">抓取最新</button>
+            <button id="bili-dyn-clear" class="danger" title="清空当前UP主的缓存数据">清空</button>
             <button id="bili-dyn-stop" class="warn" style="display:none;">⏸ 停止</button>
         </div>
-
         <div id="bili-dyn-list-wrap">
             <div style="display:flex; justify-content:space-between; font-size:10px; color:#85858d; margin-bottom:4px;">
                 <span id="bili-dyn-count">0 条</span><span>点击跳转</span>
@@ -318,7 +360,6 @@
 
     if (!isSpace) crawlBtns.style.display = 'none';
 
-    // ---------- 6. 渲染列表 ----------
     function renderList() {
         countEl.textContent = `${currentList.length} 条`;
         listEl.innerHTML = '';
@@ -364,7 +405,6 @@
     prevBtn.addEventListener('click', () => { if (currentIndex > 0) navigateTo(currentIndex - 1); });
     nextBtn.addEventListener('click', () => { if (currentIndex < currentList.length - 1) navigateTo(currentIndex + 1); });
 
-    // ---------- 7. 数据加载逻辑 ----------
     async function initData() {
         if (isSpace) {
             try {
@@ -372,7 +412,20 @@
                 currentList = list;
                 currentIndex = -1;
                 renderList();
-                statusEl.textContent = list.length > 0 ? `已从缓存加载 ${list.length} 条` : '无缓存，请点击“全量抓取”';
+                
+                const progress = getProgress(hostMid);
+                if (list.length > 0) {
+                    if (progress.is_completed) {
+                        statusEl.textContent = `已抓完所有 (${list.length} 条)`;
+                        btnFull.textContent = '重新全量';
+                    } else {
+                        statusEl.textContent = `已加载 ${list.length} 条 (未完成)`;
+                        btnFull.textContent = '继续全量';
+                    }
+                } else {
+                    statusEl.textContent = '无缓存，请点击抓取';
+                    btnFull.textContent = '全量抓取';
+                }
             } catch (e) {
                 statusEl.textContent = '读取缓存失败: ' + e.message;
             }
@@ -393,67 +446,60 @@
         }
     }
 
-    // ---------- 8. 抓取与控制逻辑 ----------
     function toggleButtons(crawling) {
         btnFull.style.display = crawling ? 'none' : 'block';
         btnIncr.style.display = crawling ? 'none' : 'block';
         btnClear.style.display = crawling ? 'none' : 'block';
         btnStop.style.display = crawling ? 'block' : 'none';
-        
         btnFull.disabled = crawling;
         btnIncr.disabled = crawling;
         btnClear.disabled = crawling;
     }
 
-    async function doCrawl(incremental) {
+    async function doCrawl(mode) {
         if (isCrawling || !isSpace) return;
         isCrawling = true;
         crawlAbort = false;
         toggleButtons(true);
-        statusEl.textContent = incremental ? '增量更新中…' : '全量抓取中…';
+        statusEl.textContent = mode === 'history' ? '获取历史数据中…' : '更新最新数据中…';
 
         try {
-            const fetched = await crawlAll(hostMid, incremental, (total, hasMore, msg) => {
+            const fetched = await crawlAll(hostMid, mode, (total, hasMore, msg) => {
                 if (msg) statusEl.textContent = msg;
-                else statusEl.textContent = `${incremental ? '增量' : '全量'}抓取: 已获取 ${total} 条${hasMore ? '…' : ' (完成)'}`;
+                else statusEl.textContent = mode === 'history' ? `历史抓取: ${total} 条…` : `最新更新: ${total} 条…`;
             });
-            statusEl.textContent = `抓取完成，本次获取 ${fetched} 条`;
+            statusEl.textContent = `操作完成，本次获取 ${fetched} 条`;
             await initData();
         } catch (e) {
-            statusEl.textContent = '抓取出错: ' + e.message;
+            statusEl.textContent = '出错: ' + e.message + '（进度已保存）';
         } finally {
             isCrawling = false;
             toggleButtons(false);
         }
     }
 
-    btnFull.addEventListener('click', () => doCrawl(false));
-    btnIncr.addEventListener('click', () => doCrawl(true));
-    btnStop.addEventListener('click', () => {
-        crawlAbort = true;
-        statusEl.textContent = '正在停止…';
-    });
+    btnFull.addEventListener('click', () => doCrawl('history'));
+    btnIncr.addEventListener('click', () => doCrawl('update'));
+    btnStop.addEventListener('click', () => { crawlAbort = true; statusEl.textContent = '正在停止（进度已保存）…'; });
 
-    // 清空缓存事件
     btnClear.addEventListener('click', async () => {
         if (isCrawling) return;
-        const confirmed = confirm("⚠️ 警告：确定要清空当前UP主的所有本地缓存吗？\n\n此操作不可逆，下次需要重新进行全量抓取。");
-        if (!confirmed) return;
-
+        if (!confirm("⚠️ 警告：确定要清空当前UP主的所有本地缓存和抓取进度吗？\n\n此操作不可逆。")) return;
         try {
-            statusEl.textContent = '正在清空缓存…';
+            statusEl.textContent = '正在清空…';
             await clearCache(hostMid);
-            GM_setValue('bili_nav_session', null); // 顺便清空可能存在的跨域会话
+            GM_setValue(`bili_progress_${hostMid}`, { offset: '', is_completed: false, count: 0 });
+            GM_setValue('bili_nav_session', null);
             currentList = [];
             currentIndex = -1;
             renderList();
+            btnFull.textContent = '全量抓取';
             statusEl.textContent = '缓存已清空。';
         } catch (e) {
             statusEl.textContent = '清空失败: ' + e.message;
         }
     });
 
-    // ---------- 9. 初始化与交互 ----------
     ball.addEventListener('click', () => {
         const hidden = panel.style.display !== 'flex';
         panel.style.display = hidden ? 'flex' : 'none';
